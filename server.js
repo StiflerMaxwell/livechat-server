@@ -5,35 +5,36 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-const SSE = require('express-sse'); // 用于 Server-Sent Events
-require('dotenv').config();
+const SSE = require('express-sse');
+require('dotenv').config(); // Load .env for local testing
+
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// --- 目录配置 ---
+// --- Directory Configuration ---
 const baseDir = __dirname; // Get directory of server.js
 const uploadDir = path.join(baseDir, 'uploads');
 const outputDir = path.join(baseDir, 'analyzed_results');
 const pythonScriptPath = path.join(baseDir, 'run_analysis_workflow.py');
 
-// 获取 Python 解释器的完整路径 (从环境变量 PYTHON_EXECUTABLE 获取，或默认使用 'python')
+// Get Python executable path
 const pythonExecutablePath = process.env.PYTHON_EXECUTABLE || 'python';
 if (pythonExecutablePath === 'python') {
-    console.warn('PYTHON_EXECUTABLE environment variable is not set. Using "python" command. Ensure "python" is in the system PATH.');
+    console.warn('PYTHON_EXECUTABLE environment variable is not set. Using "python" command.');
 } else {
-     console.log(`Python executable path: ${pythonExecutablePath}`);
+     console.log(`Using Python executable: ${pythonExecutablePath}`);
 }
 
 
-// 确保目录存在
+// Ensure directories exist
 fs.existsSync(uploadDir) || fs.mkdirSync(uploadDir, { recursive: true });
 fs.existsSync(outputDir) || fs.mkdirSync(outputDir, { recursive: true });
 
-// --- 文件上传配置 ---
+// --- Multer File Upload Configuration ---
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, uploadDir); // 将文件保存在 ./uploads 目录下
+    cb(null, uploadDir);
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now();
@@ -43,36 +44,69 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage, limits: { fileSize: 1024 * 1024 * 50 } }); // Limit file size to 50MB
 
-// --- SSE 实例 ---
-const sse = new SSE(["message"]); // Initial data if needed
+
+// --- SSE Instance ---
+const sse = new SSE();
 
 
-// --- 中间件 ---
-app.use(cors()); // Allow cross-origin requests (adjust origin in production)
+// --- Middleware ---
+app.use(cors()); // Adjust origin in production
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- 路由 ---
+// --- Helper function to delete old analysis files ---
+const cleanupOldAnalysisFiles = async () => {
+    console.log(`Attempting to clean up old analysis files in: ${outputDir}`);
+    try {
+        const files = await fs.promises.readdir(outputDir);
+        let deletedCount = 0;
+        for (const file of files) {
+            // Only delete files matching the analysis result pattern and with .xlsx extension
+            if (file.startsWith('analysis_result_') && file.endsWith('.xlsx')) {
+                 const filePath = path.join(outputDir, file);
+                 try {
+                     await fs.promises.unlink(filePath);
+                     console.log(`Deleted old analysis file: ${filePath}`);
+                     deletedCount++;
+                 } catch (err) {
+                     console.error(`Error deleting old analysis file ${filePath}:`, err);
+                 }
+            }
+        }
+        console.log(`Finished cleaning up old analysis files. Deleted ${deletedCount} files.`);
+    } catch (err) {
+         console.error(`Error reading analysis results directory for cleanup: ${outputDir}`, err);
+    }
+};
+// --------------------------------------------------
+
+
+// --- Routes ---
 
 app.get('/', (req, res) => {
   res.send('Chat Analysis Backend is running!');
 });
 
+// SSE connection endpoint
+app.get('/analysis_stream', sse.init);
+
+
 // File upload and analysis initiation endpoint
-// 'chatFile' is the name attribute of the input type="file" in the frontend form
-app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
+app.post('/upload_and_analyze', upload.single('chatFile'), async (req, res) => { // Made route handler async
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded.' });
   }
 
-  // TODO: Add logic to prevent multiple simultaneous analysis tasks if necessary
+  // --- NEW: Clean up old analysis files before starting new analysis ---
+  await cleanupOldAnalysisFiles();
+  // ---------------------------------------------------------------
 
 
-  const inputJsonPath = req.file.path; // Path where multer saved the temporary file
-  const outputExcelFilename = `analysis_result_${Date.now()}_${path.parse(req.file.originalname).name}.xlsx`; // Generate a unique output filename
-  const outputExcelPath = path.join(outputDir, outputExcelFilename); // Full path for the final Excel file
+  const inputJsonPath = req.file.path;
+  const outputExcelFilename = `analysis_result_${Date.now()}_${path.parse(req.file.originalname).name}.xlsx`;
+  const outputExcelPath = path.join(outputDir, outputExcelFilename); // Local path where Python saves
 
-  // Get optional limit parameter from request body
+
   const limit = req.body.limit;
   const limitArgs = [];
   if (limit !== undefined && limit !== null && limit !== '') {
@@ -81,48 +115,41 @@ app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
           limitArgs.push(limitNum.toString());
       } else {
           console.warn(`Received invalid limit value: ${limit}. Ignoring limit.`);
-          // Optionally send a warning via SSE here if stream is already initiated
       }
   }
 
-  // Arguments to pass to the Python script
   const pythonArgs = [
-    pythonScriptPath,    // Path to the Python workflow script
-    inputJsonPath,       // Argument 1: Path to the input JSON file
-    outputExcelPath,     // Argument 2: Path for the output Excel file
-    ...limitArgs         // Argument 3 (optional): Limit value
+    pythonScriptPath,
+    inputJsonPath,       // Arg 1: Input JSON path (temporary file on Render)
+    outputExcelPath,     // Arg 2: Output Excel path (local path on Render)
+    ...limitArgs         // Arg 3 (optional): Limit value
   ];
 
   console.log(`Spawning Python process: ${pythonExecutablePath} ${pythonArgs.join(' ')}`);
 
-  let pythonStdout = ''; // Buffer to collect all stdout for potential error reporting
-  let pythonStderr = ''; // Buffer to collect all stderr for potential error reporting
+  let pythonStdout = '';
+  let pythonStderr = '';
 
 
   try {
-      // Spawn the Python child process
       const pythonChildProcess = spawn(pythonExecutablePath, pythonArgs, {
-          cwd: baseDir, // Set working directory to server.js directory
-          env: { ...process.env, PYTHONIOENCODING: 'utf-8' } // Pass environment variables, ensure UTF-8 output from Python
+          cwd: baseDir,
+          env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' } // Ensure unbuffered output
       });
 
       // Capture and forward Python's stdout to SSE clients
       pythonChildProcess.stdout.on('data', (data) => {
         const dataString = data.toString();
         // console.log(`Python stdout: ${dataString.trim()}`); // Log to Node.js console
-        pythonStdout += dataString; // Collect for final error report
+        pythonStdout += dataString;
 
-        // Split by lines to process each log line
         dataString.split('\n').forEach(line => {
             if (line.startsWith('PYTHON_STATUS:')) {
                 sse.send({ type: 'status', message: line.substring('PYTHON_STATUS:'.length).trim() }, 'message');
             } else if (line.startsWith('PYTHON_PARSED_CHAT_RESULT:')) {
-                 // Send the successfully parsed JSON string to frontend
                  const jsonString = line.substring('PYTHON_PARSED_CHAT_RESULT:'.length).trim();
-                 // Frontend will parse this string as JSON and display it
                  sse.send({ type: 'parsed_result', content: jsonString }, 'message');
             } else if (line.startsWith('PYTHON_RESULT_JSON:')) {
-                 // Send final aggregated JSON result (if printed by Python)
                  const jsonContent = line.substring('PYTHON_RESULT_JSON:'.length).trim();
                  try {
                      const finalResult = JSON.parse(jsonContent);
@@ -132,7 +159,6 @@ app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
                      sse.send({ type: 'log_error', message: `Failed to parse final JSON result: ${e}. Raw content: ${jsonContent.substring(0, 200)}...` }, 'message');
                  }
             } else {
-                 // Forward other standard print statements as generic logs
                  if (line.trim()) {
                     sse.send({ type: 'log', message: line.trim() }, 'message');
                  }
@@ -144,109 +170,119 @@ app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
       pythonChildProcess.stderr.on('data', (data) => {
         const dataString = data.toString();
         // console.error(`Python stderr: ${dataString.trim()}`); // Log to Node.js console
-        pythonStderr += dataString; // Collect for final error report
+        pythonStderr += dataString;
 
-        // Split by lines to process each log line
          dataString.split('\n').forEach(line => {
              if (line.startsWith('PYTHON_FATAL_ERROR:')) {
-                 sse.send({ type: 'fatal_error', message: line.substring('PYTHON_FATAL_ERROR:'.length).trim(), details: pythonStderr }, 'message'); // Include all stderr in fatal error
+                 sse.send({ type: 'fatal_error', message: line.substring('PYTHON_FATAL_ERROR:'.length).trim(), details: pythonStderr }, 'message');
              } else if (line.startsWith('PYTHON_ERROR:')) {
                   sse.send({ type: 'error', message: line.substring('PYTHON_ERROR:'.length).trim() }, 'message');
              } else if (line.startsWith('PYTHON_WARNING:')) {
                   sse.send({ type: 'warning', message: line.substring('PYTHON_WARNING:'.length).trim() }, 'message');
              } else if (line.trim()) {
-                 // Forward other standard error print statements as generic error logs
                  sse.send({ type: 'log_error', message: line.trim() }, 'message');
              }
          });
       });
 
       // Listen for Python process exit
-      pythonChildProcess.on('close', (code) => {
+      pythonChildProcess.on('close', async (code) => { // Made the close listener async
         console.log(`Python process exited with code ${code}`);
 
-        // Clean up temporary uploaded JSON file
-        fs.unlink(inputJsonPath, (err) => {
-          if (err) console.error(`Error removing temporary input file ${inputJsonPath}:`, err);
-          else console.log(`Temporary input file ${inputJsonPath} removed.`);
-        });
+        // Clean up temporary uploaded JSON file immediately after process finishes
+        if (fs.existsSync(inputJsonPath)) {
+             console.log(`Attempting to remove temporary input file: ${inputJsonPath}`);
+             try {
+                 await fs.promises.unlink(inputJsonPath); // Use async unlink
+                 console.log(`Temporary input file ${inputJsonPath} removed.`);
+             } catch (err) {
+                  console.error(`Error removing temporary input file ${inputJsonPath}:`, err);
+             }
+        }
 
         // Use collected stdout/stderr for final error report if needed
         const finalStdout = pythonStdout;
         const finalStderr = pythonStderr;
 
-
         if (code === 0) {
           // Python script finished successfully
           // Check if the expected output file was created
           if (fs.existsSync(outputExcelPath)) {
-            // --- FIX: Send 'complete' as the SSE event name ---
+            console.log(`Python generated output file: ${outputExcelPath}`);
+
+            // --- Send 'complete' SSE event with the LOCAL download URL ---
+            // Frontend will download this file from *this* Render backend instance
             sse.send({ // Data payload for the 'complete' event
               status: 'Analysis complete',
               filename: outputExcelFilename,
-              downloadUrl: `/download/${outputExcelFilename}`, // Relative URL for download
+              // The frontend will use its backendUrl + this relative path to download
+              downloadUrl: `/download/${outputExcelFilename}`,
               // Optional: Include captured output in complete event data for debugging
               // stdout: finalStdout,
               // stderr: finalStderr
             }, 'complete'); // <-- THIS is the SSE event name
-            // --------------------------------------------------------------------------
-            console.log(`Analysis complete. Output file: ${outputExcelPath}`);
+            // -------------------------------------------------------------
+
+            console.log(`Analysis complete. Local Download URL sent.`);
+
+            // *** Removed immediate deletion here ***
+            // The file will remain until the *next* upload triggers cleanupOldAnalysisFiles
+            // or the Render instance restarts/cleans its ephemeral storage.
+
+
           } else {
             // Python exited with 0, but output file is missing - indicates a problem in Python's saving logic
             const errorMessage = 'Analysis completed (Python exit code 0), but output file was not found.';
             console.error(errorMessage);
-             // --- Send an 'error' event if output file missing ---
              sse.send({
                  type: 'error', // Data payload type
                  message: errorMessage,
                  details: `Expected file: ${outputExcelPath}\n` + finalStdout + finalStderr
-             }, 'error'); // <-- Send as 'error' event
-             // ------------------------------------------------
+             }, 'error'); // Send as 'error' event
           }
         } else {
           // Python script failed (non-zero exit code)
           const errorMessage = `Analysis failed during Python execution. Exit code: ${code}.`;
           console.error(errorMessage);
-           // --- Send an 'error' event for process failure ---
+           // Send an 'error' or 'fatal_error' event for process failure
            // Check if a fatal error was already reported by PythonStderr
            if (!finalStderr.includes('PYTHON_FATAL_ERROR:')) {
               sse.send({
-                  type: 'error', // Data payload type
+                  type: 'fatal_error', // Use fatal_error for process termination
                   message: errorMessage,
                   details: finalStdout + finalStderr
-              }, 'error'); // <-- Send as 'error' event
+              }, 'fatal_error');
            }
-           // If PYTHON_FATAL_ERROR was printed, it should have been sent via stderr handler already
-           // The fatal_error event listener in frontend will handle setting isAnalyzing=false
-
-           // If no fatal_error log was sent, ensure isAnalyzing=false is handled by error listener
         }
-
-        // No sse.send('end') is needed here.
       });
 
       // Listen for process spawn errors (e.g., python command not found)
-      pythonChildProcess.on('error', (err) => {
+      pythonChildProcess.on('error', async (err) => { // Made the error listener async
          const errorMessage = 'Failed to spawn python process. Check if python executable is in PATH or configured correctly via PYTHON_EXECUTABLE env var.';
          console.error(errorMessage, err);
          // Clean up input file in case of spawn error
          if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-             fs.unlink(req.file.path, (unlinkErr) => { if (unlinkErr) console.error(`Error removing temp file after spawn error:`, unlinkErr); });
+             console.log(`Attempting to remove input file after spawn error: ${req.file.path}`);
+             try {
+                await fs.promises.unlink(req.file.path); // Use async unlink
+                console.log(`Input file ${req.file.path} removed after spawn error.`);
+             } catch (unlinkErr) {
+                 console.error(`Error removing input file ${req.file.path} after spawn error:`, unlinkErr);
+             }
          }
          // Send a fatal error event to the frontend
          sse.send({
-             type: 'fatal_error', // Data payload type
+             type: 'fatal_error',
              message: errorMessage,
              details: err.message
-         }, 'fatal_error'); // <-- Send as 'fatal_error' event
+         }, 'fatal_error');
       });
 
 
       // Send initial success response to the frontend immediately after spawning
-      // This response does NOT signal analysis completion, only that the process started
       res.status(202).json({
           status: 'File uploaded and analysis initiated. Connect to /analysis_stream for progress.',
-          outputFilename: outputExcelFilename // Send the expected output filename
+          outputFilename: outputExcelFilename // Send the expected output filename (for frontend reference)
       });
 
   } catch (error) {
@@ -254,7 +290,13 @@ app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
       console.error('Synchronous error during upload/spawn:', error);
       // Clean up input file in case of synchronous error
       if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-          fs.unlink(req.file.path, (unlinkErr) => { if (unlinkErr) console.error(`Error removing temp file after sync error:`, unlinkErr); });
+          console.log(`Attempting to remove input file after synchronous error: ${req.file.path}`);
+          try {
+             await fs.promises.unlink(req.file.path); // Use async unlink
+             console.log(`Input file ${req.file.path} removed after synchronous error.`);
+          } catch (unlinkErr) {
+              console.error(`Error removing input file ${req.file.path} after synchronous error:`, unlinkErr);
+          }
       }
       // Send error response to frontend
       res.status(500).json({ error: 'Server failed to initiate analysis.', details: error.message });
@@ -262,41 +304,39 @@ app.post('/upload_and_analyze', upload.single('chatFile'), (req, res) => {
 
 });
 
-// SSE connection endpoint
-app.get('/analysis_stream', sse.init);
-
-
-// File download endpoint
+// --- File download endpoint (serving from local disk) ---
 app.get('/download/:filename', (req, res) => {
   const filename = req.params.filename;
   // Sanitize filename to prevent directory traversal attacks
   const safeFilename = path.basename(filename);
   const filePath = path.join(outputDir, safeFilename);
 
-  console.log(`Attempting to download file: ${filePath}`);
+  console.log(`Attempting to serve local file for download: ${filePath}`);
 
   // Check if the file exists and is within the output directory
+  // Note: File persistence here depends on Render's ephemeral storage and cleanup speed.
   if (fs.existsSync(filePath) && filePath.startsWith(outputDir)) {
     res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    // Use res.sendFile for potentially larger files
+    // Use res.sendFile for serving files
     res.sendFile(filePath, (err) => {
       if (err) {
         console.error(`Error during file download ${filePath}:`, err);
         // Check if headers have already been sent before trying to send a new response
         if (!res.headersSent) {
-             if (err.code === 'ENOENT') {
-                 res.status(404).send('File not found.');
-             } else {
+             if (err.code === 'ENOENT') { // File not found error
+                 res.status(404).send('File not found (might have been removed).');
+             } else { // Other potential errors during transfer
                  res.status(500).send('Error downloading file.');
              }
         }
       } else {
           console.log(`File ${safeFilename} downloaded successfully.`);
+          // File will be removed on the *next* file upload, not after download
       }
     });
   } else {
     console.warn(`File not found or not allowed for download: ${filePath}`);
-    res.status(404).json({ error: 'File not found or access denied.' });
+    res.status(404).json({ error: 'File not found (might have been removed).' });
   }
 });
 
@@ -310,5 +350,6 @@ app.listen(port, () => {
        console.error(`FATAL: Python workflow script not found at ${pythonScriptPath}. Analysis will fail.`);
    }
    console.log(`Using Python executable: ${pythonExecutablePath}`);
+   // publicDownloadUrlBase is not used anymore for link construction, frontend uses its own backendUrl + relative path
 
 });
