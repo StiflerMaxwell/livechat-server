@@ -50,7 +50,38 @@ const sse = new SSE();
 
 
 // --- Middleware ---
-app.use(cors()); // Adjust origin in production
+ 
+const cors = require('cors');
+// ...
+
+// --- Define allowed origins ---
+// Get your Netlify site's URL from the Netlify dashboard.
+// It should look like https://your-site-name.netlify.app
+// For local development, you might also need to allow localhost
+const allowedOrigins = [
+    'https://vertu-ga.netlify.app/', // <-- REPLACE with your actual Netlify site URL
+    'http://localhost:5173', // Or your local frontend dev server URL
+    'http://localhost:3000'  // Or your local frontend dev server URL
+];
+
+// --- CORS Configuration ---
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    // and requests from the defined allowedOrigins
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
+  // You might also need to specify allowed methods and headers if you use non-default ones,
+  // but for simple POST and GET with standard headers, origin is usually enough.
+  // methods: ['GET', 'POST'],
+  // allowedHeaders: ['Content-Type'],
+}));
+
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
