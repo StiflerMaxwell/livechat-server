@@ -58,27 +58,31 @@ const cors = require('cors');
 // It should look like https://your-site-name.netlify.app
 // For local development, you might also need to allow localhost
 const allowedOrigins = [
-    'https://vertu-ga.netlify.app/', // <-- REPLACE with your actual Netlify site URL
-    'http://localhost:5173', // Or your local frontend dev server URL
-    'http://localhost:3000'  // Or your local frontend dev server URL
+  'https://vertu-ga.netlify.app', // <-- 移除了末尾的斜杠
+  'http://localhost:5173',
+  'http://localhost:3000'
 ];
 
 // --- CORS Configuration ---
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    // and requests from the defined allowedOrigins
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+origin: function (origin, callback) {
+  // Allow requests with no origin (like mobile apps or curl requests)
+  // and requests from the defined allowedOrigins
+  if (!origin || allowedOrigins.includes(origin)) {
+    callback(null, true);
+  } else {
+    // Log the disallowed origin for debugging
+    console.error(`CORS Error: Not allowed by CORS. Origin received: ${origin}`);
+    callback(new Error('Not allowed by CORS'));
   }
-  // You might also need to specify allowed methods and headers if you use non-default ones,
-  // but for simple POST and GET with standard headers, origin is usually enough.
-  // methods: ['GET', 'POST'],
-  // allowedHeaders: ['Content-Type'],
+}
+// methods and allowedHeaders are usually not needed for simple requests,
+// but keep them commented out if you think they might be relevant for complex scenarios.
+// methods: ['GET', 'POST'],
+// allowedHeaders: ['Content-Type'],
 }));
+
+// ... rest of your server.js code ...
 
 
 app.use(express.json());
