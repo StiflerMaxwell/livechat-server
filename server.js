@@ -4,7 +4,6 @@ const multer = require('multer');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const cors = require('cors');
 const SSE = require('express-sse');
 require('dotenv').config(); // Load .env for local testing
 
