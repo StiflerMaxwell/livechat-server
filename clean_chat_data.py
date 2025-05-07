@@ -1,6 +1,10 @@
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import sys
+
+# 定义香港时区 (UTC+8)
+HKT = timezone(timedelta(hours=8))
 
 def clean_chat_data(input_file, output_file):
     # 读取输入文件
@@ -48,18 +52,31 @@ def clean_chat_data(input_file, output_file):
 
             # 格式化时间
             try:
-                # 兼容 'Z' 和非 'Z' 的ISO格式，并处理可能的None或空字符串
+                # 兼容 'Z' 和非 'Z' 的ISO格式
                 if created_at:
-                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    # 尝试解析时间字符串
+                    dt_original = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+
+                    # 如果是 naive datetime (无时区信息)，假设它是 UTC 并标记
+                    if dt_original.tzinfo is None:
+                        dt_utc = dt_original.replace(tzinfo=timezone.utc) # 标记为 UTC
+                    else:
+                        dt_utc = dt_original
+
+                    # 将时间转换为香港时间 (HKT)
+                    dt_hkt = dt_utc.astimezone(HKT)
+
+                    # 格式化为不带时区信息的字符串 (保持原有输出格式)
+                    formatted_time = dt_hkt.strftime('%Y-%m-%d %H:%M:%S')
                 else:
-                    formatted_time = '' # 或者其他默认值
-            except (ValueError, TypeError): # 捕获ValueError和TypeError
-                 # print(f"警告: 对话ID {chat_id} 中的时间格式 '{created_at}' 无效，使用原始字符串。") # 可以选择打印警告
-                 formatted_time = created_at
-            except Exception as e:
-                 # print(f"警告: 对话ID {chat_id} 中处理时间 '{created_at}' 时发生错误: {e}，使用原始字符串。") # 可以选择打印警告
-                 formatted_time = created_at
+                    formatted_time = '' # 处理 None 或空字符串
+
+            except (ValueError, TypeError) as e: # 捕获解析错误
+                print(f"WARNING: Could not parse or convert time \'{created_at}\' for chat ID {chat_id}: {e}. Using original string.", file=sys.stderr) # 打印警告到 stderr
+                formatted_time = created_at # 解析失败时使用原始字符串
+            except Exception as e: # 捕获其他可能的错误
+                print(f"WARNING: Unexpected error processing time \'{created_at}\' for chat ID {chat_id}: {e}. Using original string.", file=sys.stderr) # 打印警告到 stderr
+                formatted_time = created_at # 发生其他错误时使用原始字符串
 
 
             # 判断消息发送者
