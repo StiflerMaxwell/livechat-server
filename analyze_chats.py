@@ -44,24 +44,26 @@ def calculate_timing_metrics(messages):
     first_customer_time = None
     first_agent_reply_time = None
     customer_message_found = False
+    first_message_time = None
 
-    for message in messages:
-        if message.get('sender') == 'Customer' and message.get('time'):
+    for i, message in enumerate(messages):
+        if message.get('time'):
             try:
-                msg_time = datetime.fromisoformat(message['time'])
-                if not customer_message_found:
-                    first_customer_time = msg_time
-                    customer_message_found = True
-            except (ValueError, TypeError):
-                pass
+                msg_time = datetime.fromisoformat(message['time'].replace('Z', '+00:00'))
+                if i == 0:
+                    first_message_time = msg_time
 
-        if customer_message_found and message.get('sender') == 'Agent' and message.get('time'):
-             try:
-                 msg_time = datetime.fromisoformat(message['time'])
-                 if first_customer_time and msg_time is not None and first_customer_time is not None and msg_time >= first_customer_time:
-                     first_agent_reply_time = msg_time
-                     break
-             except (ValueError, TypeError):
+                if message.get('sender') == 'Customer':
+                    if not customer_message_found:
+                        first_customer_time = msg_time
+                        customer_message_found = True
+
+                if customer_message_found and message.get('sender') == 'Agent':
+                    if first_customer_time and msg_time is not None and msg_time >= first_customer_time:
+                        first_agent_reply_time = msg_time
+                        break
+
+            except (ValueError, TypeError) as e:
                 pass
 
     response_time_seconds = None
@@ -69,14 +71,19 @@ def calculate_timing_metrics(messages):
 
     if first_customer_time and first_agent_reply_time:
         time_difference = first_agent_reply_time - first_customer_time
-        response_time_seconds = time_difference.total_seconds()
-        is_qualified = "合格" if response_time_seconds is not None and response_time_seconds <= 30 else "不合格"
+        if time_difference.total_seconds() >= 0:
+            response_time_seconds = time_difference.total_seconds()
+            is_qualified = "合格" if response_time_seconds <= 30 else "不合格"
+        else:
+            is_qualified = "异常时间"
+
     elif first_customer_time and not first_agent_reply_time:
-         is_qualified = "无回复"
+        is_qualified = "无回复"
 
     return {
         "首次回复时长 (秒)": round(response_time_seconds, 2) if response_time_seconds is not None else None,
-        "是否合格 (30秒内合格)": is_qualified
+        "是否合格 (30秒内合格)": is_qualified,
+        "初始对话时间段": first_message_time.strftime('%Y-%m-%d %H:%M:%S') if first_message_time else None
     }
 
 def analyze_chat_with_gemini(transcript, client, model_name, chat_id):
@@ -296,11 +303,12 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
         # Combine results for the final Excel/JSON list
         chat_analysis = {
             "chat_id": chat_id, # --- Ensure chat_id is included here ---
-            "客户意图总结": analysis_content.get("客户意图总结", ""),
-            "聊天质量点评 (基于内容)": analysis_content.get("聊天质量点评 (基于内容)", ""),
-            "改进建议 (具体动作)": analysis_content.get("改进建议 (具体动作)", ""),
-            "潜在成交机会": analysis_content.get("潜在成交机会", ""),
-            "情绪负面评价": analysis_content.get("情绪负面评价", ""),
+            "初始对话时间段": timing_metrics.get("初始对话时间段"),
+            "客户意图总结": analysis_content.get("客户意图总结", "") if analysis_content.get("客户意图总结", "") else "[无信息]",
+            "聊天质量点评 (基于内容)": analysis_content.get("聊天质量点评 (基于内容)", "") if analysis_content.get("聊天质量点评 (基于内容)", "") else "[无信息]",
+            "改进建议 (具体动作)": analysis_content.get("改进建议 (具体动作)", "") if analysis_content.get("改进建议 (具体动作)", "") else "[无信息]",
+            "潜在成交机会": analysis_content.get("潜在成交机会", "") if analysis_content.get("潜在成交机会", "") else "[无信息]",
+            "情绪负面评价": analysis_content.get("情绪负面评价", "") if analysis_content.get("情绪负面评价", "") else "[无信息]",
             "首次回复时长 (秒)": timing_metrics["首次回复时长 (秒)"],
             "是否合格 (30秒内合格)": timing_metrics["是否合格 (30秒内合格)"]
         }
@@ -323,32 +331,137 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
     print(f"\nPYTHON_STATUS: Finished analysis loop for {total_chats_to_process} chats.")
     print(f"PYTHON_STATUS: Summary: Successful API calls: {successful_api_calls}, Skipped/Failed: {skipped_api_calls}, Total Processed: {total_chats_to_process}")
 
-    # --- 根据参数决定是否在控制台输出最终分析结果 ---
-    if print_results_to_console:
-        # --- REMOVED: Header line print ---
-        # print("PYTHON_RESULT_JSON: --- Final Analysis Results (JSON Format) ---")
-        # -----------------------------------
-        if analyzed_results:
-            try:
-                 # --- Print final results JSON without indent for easier parsing by Node.js ---
-                 # Using indent=2 is good for human readability in console, but complicates Node.js parsing stream.
-                 # Let's print it on a single line after the prefix for Node.js to reliably capture.
-                 # If you still need pretty print in Node.js console, Node.js can re-indent it.
-                 print(f"PYTHON_RESULT_JSON:{json.dumps(analyzed_results, ensure_ascii=False)}")
-                 # Or if you need pretty print in Python's console, you can do both:
-                 # if sys.stdout.isatty(): # Check if connected to a terminal
-                 #     print(json.dumps(analyzed_results, ensure_ascii=False, indent=2))
-                 # else: # If redirected (like to Node.js pipe)
-                 #     print(f"PYTHON_RESULT_JSON:{json.dumps(analyzed_results, ensure_ascii=False)}")
+    # --- NEW: Calculate Overall Summary Metrics ---
+    print("\nPYTHON_STATUS: Calculating overall analysis metrics...")
+    total_chats_analyzed = len(analyzed_results)
+    summary_data = {}
+    if total_chats_analyzed > 0:
+        # Basic Quantitative Summary
+        qualified_count = sum(1 for r in analyzed_results if r.get("是否合格 (30秒内合格)") == "合格")
+        no_reply_count = sum(1 for r in analyzed_results if r.get("是否合格 (30秒内合格)") == "无回复")
+        api_error_count = sum(1 for r in analyzed_results if r.get("API分析错误") != "" and r.get("API分析错误") is not None)
 
-            except Exception as e:
-                print(f"PYTHON_ERROR: Failed to serialize final results to JSON for stream: {e}", file=sys.stderr)
-                print(f"PYTHON_RESULT_JSON: Could not print final results due to error. Total results collected: {len(analyzed_results)}", file=sys.stderr)
+        qualified_percentage = (qualified_count / total_chats_analyzed) * 100 if total_chats_analyzed > 0 else 0
+
+        # Calculate average response time for *qualified* chats (those with a response time)
+        # Filter out None values before calculating average
+        response_times = [r.get("首次回复时长 (秒)") for r in analyzed_results if r.get("首次回复时长 (秒)") is not None]
+        average_response_time = sum(response_times) / len(response_times) if response_times else None
+
+        summary_data = {
+            "total_chats_processed": total_chats_to_process,
+            "total_chats_with_results": total_chats_analyzed,
+            "successful_api_calls": successful_api_calls,
+            "skipped_api_calls": skipped_api_calls,
+            "qualified_response_count": qualified_count,
+            "qualified_response_percentage": round(qualified_percentage, 2),
+            "no_reply_count": no_reply_count,
+            "api_error_count": api_error_count,
+            "average_response_time_seconds": round(average_response_time, 2) if average_response_time is not None else None,
+        }
+
+        # --- Print machine-readable summary for Node.js to capture (optional but kept for consistency) ---
+        # Node.js can choose to capture this or the final AI summary.
+        # print(f"PYTHON_SUMMARY_JSON:{json.dumps(summary_data, ensure_ascii=False)}")
+
+        # --- Also print a human-readable summary to stderr for visibility (optional but helpful) ---
+        print("\n--- Chat Analysis Overall Summary (Metrics) ---", file=sys.stderr)
+        print(f"Processed Chats: {total_chats_to_process}", file=sys.stderr)
+        print(f"Chats with Results: {total_chats_analyzed}", file=sys.stderr)
+        print(f"Successful API Calls: {successful_api_calls}", file=sys.stderr)
+        print(f"Skipped/Failed API Calls: {skipped_api_calls}", file=sys.stderr)
+        print(f"Chats Replied within 30s: {qualified_count} ({qualified_percentage:.2f}%)", file=sys.stderr)
+        print(f"Chats with No Agent Reply: {no_reply_count}", file=sys.stderr)
+        print(f"Chats with API Errors: {api_error_count}", file=sys.stderr)
+        if average_response_time is not None:
+            print(f"Average Response Time (for replied chats): {average_response_time:.2f} seconds", file=sys.stderr)
         else:
-            print("PYTHON_RESULT_JSON:[]") # Print empty array if no results
-        # --- REMOVED: Footer line print ---
-        # print("PYTHON_RESULT_JSON: ---------------------------------------")
-        # -----------------------------------
+             print("Average Response Time: N/A (No chats with agent replies)", file=sys.stderr)
+        print("-------------------------------------", file=sys.stderr)
+
+    else:
+        print("PYTHON_STATUS: No analysis results to summarize metrics from.", file=sys.stderr)
+
+    # --- NEW: Generate Overall Summary using AI ---
+    print("\nPYTHON_STATUS: Requesting overall analysis summary from AI...")
+    overall_summary_text = "整体总结生成跳过：API 客户端未初始化或无分析结果。"
+
+    # Only attempt AI summary if client is available and there are results to analyze
+    if client_instance is not None and total_chats_analyzed > 0:
+        try:
+            # Prepare the summary data for the prompt
+            summary_data_formatted = "关键汇总指标：\n"
+            for key, value in summary_data.items():
+                 # Format value appropriately
+                 display_value = f"{value:.2f}%" if isinstance(value, float) and key == "qualified_response_percentage" else value
+                 summary_data_formatted += f"- {key}：{display_value}\n"
+
+            # Construct the prompt for the overall summary
+            # Reference the types of qualitative analysis performed earlier
+            overall_summary_prompt = f"""
+作为一名专业的聊天分析师，基于以下关键汇总指标和对每条对话内容的分析，请提供本次对话批次的整体表现总结：
+
+{summary_data_formatted}
+
+请评估整体聊天表现，直击要点，并指出存在的问题。总结应涵盖：
+    -   客户响应效率（合格率、平均回复时长）
+    -   客服沟通质量的整体评估（亮点与不足）
+    -   主要客户需求和潜在业务机会
+    -   需关注的风险点（如负面情绪对话比例、AI 分析错误）
+    -   关键改进方向建议
+    -   总结必须简短精炼，突出核心发现。
+
+请直接输出总结文本：
+"""
+
+            print(f"PYTHON_STATUS: Calling AI for overall summary (Prompt len: {len(overall_summary_prompt)})...")
+            start_time = time.time()
+            overall_response = client_instance.models.generate_content(
+                model=model_name_str,
+                contents=overall_summary_prompt
+            )
+            end_time = time.time()
+            print(f"PYTHON_STATUS: Overall summary AI call successful, took {end_time - start_time:.2f} seconds.")
+
+            overall_summary_text = overall_response.text.strip()
+
+            # Check for prompt feedback or finish reason for the summary call
+            if hasattr(overall_response, 'prompt_feedback') and overall_response.prompt_feedback is not None:
+                 prompt_feedback = overall_response.prompt_feedback
+                 if hasattr(prompt_feedback, 'block_reason') and prompt_feedback.block_reason:
+                      block_reason = prompt_feedback.block_reason.name
+                      overall_summary_text = f"整体总结生成失败：AI Prompt Blocked. Reason: {block_reason}"
+                      safety_info = ""
+                      if hasattr(prompt_feedback, 'safety_ratings') and prompt_feedback.safety_ratings:
+                           safety_info = ", ".join([f"{s.category.name}: {s.probability.name}" for s in prompt_feedback.safety_ratings])
+                           overall_summary_text += (f" ({safety_info})" if safety_info else "")
+                      print(overall_summary_text, file=sys.stderr) # Log error
+                 elif hasattr(prompt_feedback, 'safety_ratings') and prompt_feedback.safety_ratings:
+                      safety_info = ", ".join([f"{s.category.name}: {s.probability.name}" for s in prompt_feedback.safety_ratings])
+                      print(f"PYTHON_WARNING: Overall summary prompt safety ratings: {safety_info}", file=sys.stderr)
+
+            if hasattr(overall_response, 'candidates') and overall_response.candidates and overall_response.candidates[0] is not None:
+                 candidate = overall_response.candidates[0]
+                 if hasattr(candidate, 'finish_reason') and candidate.finish_reason and candidate.finish_reason.name != 'STOP':
+                      finish_reason = candidate.finish_reason.name
+                      reason_detail = " Safety Ratings: " + ", ".join([f"{s.category.name}: {s.probability.name}" for s in candidate.safety_ratings]) if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings else ""
+                      overall_summary_text = f"整体总结生成警告：AI 完成原因非STOP ({finish_reason}{reason_detail}). 生成内容可能不完整或异常。\n" + overall_summary_text # Prepend warning
+                      print(overall_summary_text, file=sys.stderr) # Log warning
+
+            # --- Print the AI-generated overall summary (still useful for Node.js stream) ---
+            print("\n--- AI Generated Overall Analysis Summary (Console/Stderr) ---", file=sys.stderr) # Changed prefix to stderr
+            print(f"PYTHON_OVERALL_SUMMARY:{overall_summary_text}", file=sys.stderr) # Use specific prefix for stderr
+            print("---------------------------------------------", file=sys.stderr)
+
+        except Exception as e:
+            overall_summary_text = f"整体总结生成失败：发生异常 - {type(e).__name__} - {e}"
+            print(overall_summary_text, file=sys.stderr) # Log error
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
+    else:
+        # Print message if AI summary was skipped
+        print(f"PYTHON_OVERALL_SUMMARY:{overall_summary_text}")
 
 
     # --- 保存分析结果到 Excel 文件 ---
@@ -357,20 +470,33 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
         df = pd.DataFrame(analyzed_results)
         column_order = [
             "chat_id",
+            "初始对话时间段",
             "客户意图总结",
             "聊天质量点评 (基于内容)",
             "改进建议 (具体动作)",
             "首次回复时长 (秒)",
-            "是否合格 (30秒内合格)","潜在成交机会",
+            "是否合格 (30秒内合格)",
+            "潜在成交机会",
             "情绪负面评价",
             "API分析错误"
         ]
         df = df.reindex(columns=column_order)
         df = df.fillna("")
 
-        df.to_excel(final_output_file_excel, index=False, engine='openpyxl')
+        # Use ExcelWriter to write multiple sheets
+        with pd.ExcelWriter(final_output_file_excel, engine='openpyxl') as writer:
+            # Write the detailed analysis results to the first sheet
+            df.to_excel(writer, sheet_name='Detailed Analysis', index=False)
 
-        print(f"PYTHON_STATUS: Analysis results successfully saved to Excel file: {final_output_file_excel}")
+            # --- NEW: Write the AI-generated overall summary to a second sheet ---
+            # Format the overall summary text into a DataFrame
+            # Split the text by newlines to put each line in a new row in Excel
+            summary_lines = overall_summary_text.split('\n')
+            summary_df = pd.DataFrame(summary_lines, columns=['Overall Analysis Summary'])
+
+            summary_df.to_excel(writer, sheet_name='Overall Summary', index=False)
+
+        print(f"PYTHON_STATUS: Analysis results and overall summary successfully saved to Excel file: {final_output_file_excel}")
     except ImportError:
          print(f"PYTHON_FATAL_ERROR: Saving to Excel requires pandas and openpyxl. Install with 'pip install pandas openpyxl'.", file=sys.stderr)
     except IOError as e:
@@ -381,7 +507,7 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
         import traceback
         traceback.print_exc(file=sys.stderr)
 
-    return analyzed_results
+    return analyzed_results # Optionally return summary_data and overall_summary_text as well if needed by caller
 
 # --- 原来的 __main__ 块修改为独立运行时的逻辑 ---
 if __name__ == '__main__':
