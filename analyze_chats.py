@@ -303,6 +303,7 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
         # Combine results for the final Excel/JSON list
         chat_analysis = {
             "chat_id": chat_id, # --- Ensure chat_id is included here ---
+            "客户姓名": chat.get('customer', {}).get('name', '') if chat.get('customer', {}).get('name', '') else '[无信息]',
             "初始对话时间段": timing_metrics.get("初始对话时间段"),
             "客户意图总结": analysis_content.get("客户意图总结", "") if analysis_content.get("客户意图总结", "") else "[无信息]",
             "聊天质量点评 (基于内容)": analysis_content.get("聊天质量点评 (基于内容)", "") if analysis_content.get("聊天质量点评 (基于内容)", "") else "[无信息]",
@@ -470,6 +471,7 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
         df = pd.DataFrame(analyzed_results)
         column_order = [
             "chat_id",
+            "客户姓名",
             "初始对话时间段",
             "客户意图总结",
             "聊天质量点评 (基于内容)",
@@ -488,17 +490,55 @@ def run_analysis_process(cleaned_input_file, final_output_file_excel, client_ins
             # Write the detailed analysis results to the first sheet
             df.to_excel(writer, sheet_name='Detailed Analysis', index=False)
 
+            # 优化列宽和行高（自动换行，宽度适中）
+            worksheet = writer.sheets['Detailed Analysis']
+            for col in worksheet.columns:
+                max_length = 0
+                column = col[0].column_letter # 获取列字母
+                for cell in col:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+                # 设置较小的基础宽度，适合自动换行
+                adjusted_width = min((max_length + 2) * 0.9, 30)  # 限制最大宽度为30
+                worksheet.column_dimensions[column].width = adjusted_width
+            worksheet.row_dimensions[1].height = 28  # 表头行高
+
+            # 设置自动换行和内容居中
+            from openpyxl.styles import Alignment
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    cell.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
+
             # --- NEW: Write the AI-generated overall summary to a second sheet ---
-            # Format the overall summary text into a DataFrame
-            # Split the text by newlines to put each line in a new row in Excel
             summary_lines = overall_summary_text.split('\n')
             summary_df = pd.DataFrame(summary_lines, columns=['Overall Analysis Summary'])
-
             summary_df.to_excel(writer, sheet_name='Overall Summary', index=False)
+
+            # 美化 Overall Summary 工作表
+            summary_ws = writer.sheets['Overall Summary']
+            from openpyxl.styles import Alignment, Font, PatternFill
+            # 设置表头加粗、底色
+            header_cell = summary_ws['A1']
+            header_cell.font = Font(bold=True, size=13)
+            header_cell.fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+            # 设置内容区域字体、行高、适当列宽
+            for row in summary_ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = Font(size=12)
+                    cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='left')
+            # 自动调整列宽（尽量大，适合长文本）
+            max_length = max(len(str(cell.value)) if cell.value else 0 for cell in summary_ws['A'])
+            summary_ws.column_dimensions['A'].width = min((max_length + 8) * 1.2, 120)  # 最大宽度120
+            # 设置每行高度更大，适合长文本自动换行
+            for row in range(2, summary_ws.max_row + 1):
+                summary_ws.row_dimensions[row].height = 38
 
         print(f"PYTHON_STATUS: Analysis results and overall summary successfully saved to Excel file: {final_output_file_excel}")
     except ImportError:
-         print(f"PYTHON_FATAL_ERROR: Saving to Excel requires pandas and openpyxl. Install with 'pip install pandas openpyxl'.", file=sys.stderr)
+        print(f"PYTHON_FATAL_ERROR: Saving to Excel requires pandas and openpyxl. Install with 'pip install pandas openpyxl'.", file=sys.stderr)
     except IOError as e:
         print(f"PYTHON_FATAL_ERROR: IO error writing file {final_output_file_excel}: {e}", file=sys.stderr)
         print("PYTHON_FATAL_ERROR: Please ensure the file is not open and you have write permissions.", file=sys.stderr)
