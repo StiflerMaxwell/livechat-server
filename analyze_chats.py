@@ -18,7 +18,7 @@ API_KEY = os.environ.get('GOOGLE_API_KEY')
 
 # --- API Key 和客户端/模型加载 ---
 client = None
-MODEL_NAME = 'gemini-2.5-flash'
+MODEL_NAME = 'gemini-2.5-flash-lite'
 
 if not API_KEY:
     print("PYTHON_WARNING: GOOGLE_API_KEY not set. API calls will be skipped.", file=sys.stderr)
