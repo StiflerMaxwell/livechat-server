@@ -34,7 +34,7 @@ class ChatDataProcessor:
         
         有效咨询标准：
         - 必须有有效的邮箱或电话号码
-        - 仅有名字的记录将被排除
+        - 电话号码不限制位数
         - 排除测试邮箱和测试姓名
         """
         print(f"开始清洗聊天数据: {input_file}")
@@ -56,47 +56,89 @@ class ChatDataProcessor:
             # 提取基本信息
             chat_id = chat.get('id', '')
             users = chat.get('users', [])
-            thread = chat.get('thread', {})
-            events = thread.get('events', [])
-            
-            # 提取thread properties信息
-            thread_properties = thread.get('properties', {})
-            routing_info = thread_properties.get('routing', {})
+            events = chat.get('events', [])
+            created_at = chat.get('created_at', '')
 
             # 提取客户信息
-            customer = next((user for user in users if user.get('type') == 'customer'), {})
-            customer_id = customer.get('id')
+            customer = next((user for user in users if user.get('type') == 'customer'), None)
+            if not customer:
+                continue
+                
+            customer_id = customer.get('id', '')
             customer_name = customer.get('name', '')
             customer_email = customer.get('email', '')
             customer_phone = customer.get('phone', '')
             
+            # 从session_fields中提取邮箱和电话
+            session_fields = customer.get('session_fields', [])
+            for field in session_fields:
+                if isinstance(field, dict):
+                    for key, value in field.items():
+                        if 'email' in key.lower() and value and not customer_email:
+                            customer_email = value
+                        # 更严格的电话号码字段匹配，避免产品名称被误认为电话号码
+                        elif (key.lower() in ['phone', 'phone_number', 'mobile', 'mobile_number', 'telephone'] 
+                              and value and not customer_phone):
+                            customer_phone = value
+            
+            # 从events中提取表单数据（包括prechat表单）
+            for event in events:
+                if event.get('type') == 'form':
+                    # 处理标准form_data格式
+                    form_data = event.get('properties', {}).get('form_data', {})
+                    if 'email' in form_data and form_data['email'] and not customer_email:
+                        customer_email = form_data['email']
+                    if 'phone' in form_data and form_data['phone'] and not customer_phone:
+                        customer_phone = form_data['phone']
+                    
+                    # 处理prechat表单格式
+                    if event.get('properties', {}).get('form_type') == 'prechat':
+                        fields = event.get('properties', {}).get('fields', [])
+                        for field in fields:
+                            if isinstance(field, dict):
+                                field_name = field.get('name', '')
+                                field_answer = field.get('answer', '')
+                                
+                                # 提取Phone Number字段
+                                if field_name == 'Phone Number' and field_answer and not customer_phone:
+                                    customer_phone = field_answer
+                                
+                                # 提取Email字段
+                                elif 'email' in field_name.lower() and field_answer and not customer_email:
+                                    customer_email = field_answer
+            
             # 提取用户来源信息
             visit_info = customer.get('visit', {})
-            session_fields = customer.get('session_fields', [])
+            
+            # 提取起始URL
+            start_url = ''
+            last_pages = visit_info.get('last_pages', [])
+            if last_pages:
+                start_url = last_pages[0].get('url', '')
             
             # 构建来源数据
             source_data = {
                 'referrer': visit_info.get('referrer', ''),
+                'start_url': start_url,
                 'ip': visit_info.get('ip', ''),
                 'user_agent': visit_info.get('user_agent', ''),
                 'geolocation': visit_info.get('geolocation', {}),
                 'visit_started_at': visit_info.get('started_at', ''),
                 'visit_ended_at': visit_info.get('ended_at', ''),
                 'session_fields': session_fields,
-                'last_pages': visit_info.get('last_pages', []),
-                'start_url': routing_info.get('start_url', '')  # 从thread.properties.routing提取start_url
+                'last_pages': last_pages
             }
 
             # 提取对话内容
             messages = []
             for event in events:
                 event_type = event.get('type', '')
-                created_at = event.get('created_at', '')
+                event_created_at = event.get('created_at', '')
                 author_id = event.get('author_id', '')
                 text = event.get('text', '')
 
                 # 格式化时间
-                formatted_time = self._format_time(created_at, chat_id)
+                formatted_time = self._format_time(event_created_at, chat_id)
 
                 # 判断消息发送者
                 sender = 'Customer' if customer_id and author_id == customer_id else 'Agent'
@@ -113,7 +155,7 @@ class ChatDataProcessor:
                     'content': text.strip()
                 })
 
-            # 判断是否为有效咨询（必须有邮箱或电话，仅有名字的不算）
+            # 判断是否为有效咨询（必须有邮箱或电话）
             referrer = source_data.get('referrer', '')
             if self._is_valid_consultation(customer_name, customer_email, customer_phone, referrer):
                 cleaned_chat = {
@@ -124,7 +166,8 @@ class ChatDataProcessor:
                         'phone': customer_phone
                     },
                     'source': source_data,
-                    'messages': messages
+                    'messages': messages,
+                    'created_at': created_at
                 }
                 cleaned_chats.append(cleaned_chat)
 
@@ -141,11 +184,11 @@ class ChatDataProcessor:
             print(f"写入文件失败: {e}")
             return initial_chat_count, 0
 
-    def convert_to_enhanced_format(self, cleaned_file, enhanced_file):
+    def convert_to_simplified_format(self, cleaned_file, output_file):
         """
-        第二步：将清洗后的数据转换为增强格式
+        第二步：将清洗后的数据转换为简化格式，只保留需要的字段
         """
-        print(f"开始转换为增强格式: {cleaned_file}")
+        print(f"开始转换为简化格式: {cleaned_file}")
         
         try:
             with open(cleaned_file, 'r', encoding='utf-8') as f:
@@ -154,7 +197,7 @@ class ChatDataProcessor:
             print(f"读取清洗后的数据失败: {e}")
             return 0
 
-        enhanced_conversations = []
+        simplified_records = []
 
         for chat in cleaned_data:
             chat_id = chat.get('chat_id', '')
@@ -165,63 +208,44 @@ class ChatDataProcessor:
             # 提取客户信息
             email = customer.get('email', '').strip()
             phone = customer.get('phone', '').strip()
+            name = customer.get('name', '').strip()
             
             # 提取来源信息
             referrer = source.get('referrer', '')
-            geolocation = source.get('geolocation', {})
-            last_pages = source.get('last_pages', [])
-            
-            # 提取起始URL (从thread.properties.routing.start_url)
             start_url = source.get('start_url', '')
-            
-            # 确定渠道
-            channel = self._determine_channel(referrer)
+            geolocation = source.get('geolocation', {})
             
             # 提取创建时间（使用第一条消息的时间）
             created_at = ''
-            messages_count = len(messages)
             if messages:
-                # 将第一条消息时间转换为ISO格式
-                first_message_time = messages[0].get('time', '')
-                created_at = self._convert_to_iso_format(first_message_time)
+                created_at = messages[0].get('time', '')
 
-            # 添加Started on字段（使用HKT时间格式）
-            started_on = ''
-            if messages:
-                started_on = messages[0].get('time', '')  # 这已经是HKT格式的时间
-
-            # 构建增强对话记录
-            enhanced_record = {
+            # 构建简化记录，只保留需要的字段
+            simplified_record = {
                 'id': chat_id,
+                'name': name,
                 'email': email,
                 'phone': phone,
-                'channel': channel,
+                'start_url': start_url,
                 'referrer': referrer,
-                'start_url': start_url,  # 添加起始URL字段
                 'country': geolocation.get('country', ''),
-                'region': geolocation.get('region', ''),
-                'city': geolocation.get('region', ''),  # 使用region作为city
-                'country_code': geolocation.get('country_code', ''),
                 'created_at': created_at,
-                'started_on': started_on,  # 添加Started on字段
-                'messages_count': messages_count,
-                'has_email': bool(email),
-                'has_phone': bool(phone)
+                'messages_count': len(messages)
             }
             
-            enhanced_conversations.append(enhanced_record)
+            simplified_records.append(simplified_record)
 
         # 按创建时间排序（降序）
-        enhanced_conversations.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        simplified_records.sort(key=lambda x: x.get('created_at', ''), reverse=True)
 
         try:
-            with open(enhanced_file, 'w', encoding='utf-8') as f:
-                json.dump(enhanced_conversations, f, ensure_ascii=False, indent=2)
-            print(f"增强格式数据已保存到文件: {enhanced_file}")
-            print(f"转换了 {len(enhanced_conversations)} 条记录")
-            return len(enhanced_conversations)
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(simplified_records, f, ensure_ascii=False, indent=2)
+            print(f"简化格式数据已保存到文件: {output_file}")
+            print(f"转换了 {len(simplified_records)} 条记录")
+            return len(simplified_records)
         except Exception as e:
-            print(f"保存增强格式数据失败: {e}")
+            print(f"保存简化格式数据失败: {e}")
             return 0
 
     def _format_time(self, created_at, chat_id):
@@ -287,7 +311,7 @@ class ChatDataProcessor:
         return referrer.strip().startswith('https://vertu.com/wp-admin/')
 
     def _is_valid_consultation(self, customer_name, customer_email, customer_phone, referrer=''):
-        """判断是否为有效咨询 - 只有有电话或邮箱的才算有效，仅有名字的不算"""
+        """判断是否为有效咨询 - 有邮箱或电话的都算有效，电话号码不限制位数"""
         # 如果是测试邮箱或测试姓名，直接返回False
         if self._is_test_email(customer_email) or self._is_test_name(customer_name):
             return False
@@ -298,10 +322,18 @@ class ChatDataProcessor:
         
         # 检查是否有有效的邮箱
         has_valid_email = customer_email and '@' in customer_email.strip() and not self._is_test_email(customer_email)
-        # 检查是否有有效的电话（不为空即可）
-        has_valid_phone = bool(customer_phone and customer_phone.strip())
         
-        # 只有有邮箱或电话的才算有效咨询，仅有名字的不算
+        # 检查是否有有效的电话（不为空、不是URL、不限制位数）
+        has_valid_phone = False
+        if customer_phone and customer_phone.strip():
+            phone = customer_phone.strip()
+            # 排除明显不是电话的内容
+            if not phone.startswith('http') and not phone.startswith('www') and phone != 'N/A':
+                # 简单验证：包含数字即可，不限制位数
+                if any(char.isdigit() for char in phone):
+                    has_valid_phone = True
+        
+        # 有邮箱或电话的都算有效咨询
         return has_valid_email or has_valid_phone
 
     def _determine_channel(self, referrer):
@@ -349,7 +381,7 @@ class ChatDataProcessor:
         """完整的数据处理管道"""
         # 生成文件名
         cleaned_file = f"cleaned_chats_{month_name}.json"
-        enhanced_file = f"enhanced_valid_conversations_{month_name}.json"
+        output_file = f"filtered_conversations_{month_name}.json"
         
         print("=" * 80)
         print(f"开始处理 {month_name} 的数据处理管道")
@@ -364,10 +396,10 @@ class ChatDataProcessor:
             print(f"清洗步骤失败，跳过后续处理")
             return
         
-        # 第二步：转换为增强格式
-        print("\n步骤2: 转换为增强格式")
+        # 第二步：转换为简化格式
+        print("\n步骤2: 转换为简化JSON格式")
         print("-" * 50)
-        enhanced_count = self.convert_to_enhanced_format(cleaned_file, enhanced_file)
+        output_count = self.convert_to_simplified_format(cleaned_file, output_file)
         
         # 总结
         print("\n" + "=" * 80)
@@ -375,9 +407,10 @@ class ChatDataProcessor:
         print("=" * 80)
         print(f"原始对话数: {original_count}")
         print(f"有效咨询数: {cleaned_count}")
-        print(f"增强记录数: {enhanced_count}")
+        print(f"输出记录数: {output_count}")
         if original_count > 0:
             print(f"有效率: {cleaned_count/original_count*100:.1f}%")
+        print(f"输出文件: {output_file}")
         print("=" * 80)
 
 def main():
